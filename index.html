@@ -874,15 +874,22 @@ a.length>D&&(D=a.length,p=0|1.25*D+7200,r=new Int8Array(p));a=u.lame_encode_buff
     return { source, dispose };
   }
   var AudioEngine = class {
-    constructor({ Context, onChange = () => {
-    }, diagnostic: diagnostic2 = () => {
-    }, activationTimeout = 5e3 }) {
-      Object.assign(this, { Context, onChange, diagnostic: diagnostic2, activationTimeout });
+    constructor({
+      Context,
+      onChange = () => {
+      },
+      diagnostic: diagnostic2 = () => {
+      },
+      activationTimeout = 5e3,
+      audioSession = globalThis.navigator?.audioSession
+    }) {
+      Object.assign(this, { Context, onChange, diagnostic: diagnostic2, activationTimeout, audioSession });
       this.context = null;
       this.master = null;
       this.volume = 0.9;
       this.generation = 0;
       this.nodes = /* @__PURE__ */ new Set();
+      this.unlockSources = /* @__PURE__ */ new Set();
       this.events = [];
       this.start = this.end = 0;
       this.mode = "stopped";
@@ -916,8 +923,26 @@ a.length>D&&(D=a.length,p=0|1.25*D+7200,r=new Int8Array(p));a=u.lame_encode_buff
     }
     async activate(context) {
       this.diagnostic("resume-start", { state: context.state });
-      const resume = context.state === "running" ? Promise.resolve() : context.resume();
       try {
+        if (this.audioSession) {
+          try {
+            this.audioSession.type = "playback";
+            this.diagnostic("audio-session", { type: this.audioSession.type, state: this.audioSession.state });
+          } catch (error) {
+            this.diagnostic("audio-session-error", { name: error.name, message: error.message });
+          }
+        }
+        const source = context.createBufferSource();
+        source.buffer = context.createBuffer(1, 1, context.sampleRate);
+        source.connect(context.destination);
+        this.unlockSources.add(source);
+        source.onended = () => {
+          source.onended = null;
+          source.disconnect();
+          this.unlockSources.delete(source);
+        };
+        source.start(0);
+        const resume = context.state === "running" ? Promise.resolve() : context.resume();
         await withTimeout(resume, this.activationTimeout, "Audio did not start. Tap Play or Resume to try again.");
         if (context.state !== "running") throw new Error("Audio is unavailable. Tap Play or Resume to try again.");
         this.diagnostic("resume-end", { state: context.state });
@@ -953,6 +978,14 @@ a.length>D&&(D=a.length,p=0|1.25*D+7200,r=new Int8Array(p));a=u.lame_encode_buff
           };
         }
         this.mode = "playing";
+        this.diagnostic("playback-scheduled", {
+          state: context.state,
+          currentTime: context.currentTime,
+          start: this.start,
+          end: this.end,
+          sources: this.nodes.size,
+          volume: this.volume
+        });
         this.onChange();
         return true;
       } catch (error) {
@@ -1001,6 +1034,15 @@ a.length>D&&(D=a.length,p=0|1.25*D+7200,r=new Int8Array(p));a=u.lame_encode_buff
     }
     stop() {
       ++this.generation;
+      for (const source of this.unlockSources) {
+        source.onended = null;
+        try {
+          source.stop();
+        } catch {
+        }
+        source.disconnect();
+      }
+      this.unlockSources.clear();
       for (const node of this.nodes) {
         try {
           node.source.stop();
@@ -1389,7 +1431,20 @@ a.length>D&&(D=a.length,p=0|1.25*D+7200,r=new Int8Array(p));a=u.lame_encode_buff
     return buildTimeline(state.segments, playbackSettings(), onlyIndex);
   }
   async function startPlayback(onlyIndex = null) {
-    if (state.exporting || state.loading || !state.buffer || !state.segments.length) return;
+    diagnostic("play-request", {
+      onlyIndex,
+      mode: player.mode,
+      loading: state.loading,
+      exporting: state.exporting,
+      hasBuffer: !!state.buffer,
+      segments: state.segments.length,
+      userActivation: navigator.userActivation?.isActive,
+      visibility: document.visibilityState
+    });
+    if (state.exporting || state.loading || !state.buffer || !state.segments.length) {
+      diagnostic("play-blocked");
+      return;
+    }
     state.previewing = onlyIndex !== null;
     let started;
     if (onlyIndex === null && ["paused", "interrupted"].includes(player.mode)) {
@@ -1405,7 +1460,16 @@ a.length>D&&(D=a.length,p=0|1.25*D+7200,r=new Int8Array(p));a=u.lame_encode_buff
     }
   }
   function previewSegment(index) {
-    startPlayback(index).catch((error) => setStatus(error.message, "error"));
+    startPlayback(index).catch(playbackError);
+  }
+  function playbackError(error) {
+    diagnostic("playback-error", {
+      name: error.name,
+      message: error.message,
+      mode: player.mode,
+      contextState: player.context?.state
+    });
+    setStatus(error.message, "error");
   }
   async function pausePlayback() {
     await player.pause();
@@ -1606,10 +1670,23 @@ a.length>D&&(D=a.length,p=0|1.25*D+7200,r=new Int8Array(p));a=u.lame_encode_buff
   function downloadDiagnostics() {
     if (diagnosticUrl) URL.revokeObjectURL(diagnosticUrl);
     const details = {
-      version: 1,
+      version: 2,
+      build: "safari-playback-2",
       browser: navigator.userAgent,
       pageProtocol: location.protocol,
-      context: player.context ? { state: player.context.state, sampleRate: player.context.sampleRate } : null,
+      context: player.context ? {
+        state: player.context.state,
+        sampleRate: player.context.sampleRate,
+        currentTime: player.context.currentTime
+      } : null,
+      audioSession: navigator.audioSession ? { type: navigator.audioSession.type, state: navigator.audioSession.state } : null,
+      transport: {
+        mode: player.mode,
+        sources: player.nodes.size,
+        playDisabled: ui.playButton.disabled,
+        status: ui.statusText.textContent,
+        visibility: document.visibilityState
+      },
       settings: detectionSettings(),
       playback: playbackSettings(),
       analysis: { settings: state.analysisSettings, pendingEdits: state.dirty, segments: state.segments },
@@ -1728,8 +1805,8 @@ a.length>D&&(D=a.length,p=0|1.25*D+7200,r=new Int8Array(p));a=u.lame_encode_buff
     }
   });
   ui.analyzeButton.addEventListener("click", () => analyzeSegments());
-  ui.playButton.addEventListener("click", () => startPlayback().catch((error) => setStatus(error.message, "error")));
-  ui.pauseButton.addEventListener("click", () => pausePlayback().catch((error) => setStatus(error.message, "error")));
+  ui.playButton.addEventListener("click", () => startPlayback().catch(playbackError));
+  ui.pauseButton.addEventListener("click", () => pausePlayback().catch(playbackError));
   ui.stopButton.addEventListener("click", () => stopPlayback());
   ui.exportButton.addEventListener("click", exportRepeatedAudio);
   ui.volumeInput.addEventListener("input", () => player.setVolume(playbackSettings().volume));
