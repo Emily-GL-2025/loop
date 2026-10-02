@@ -7,7 +7,6 @@
 [![Website](https://img.shields.io/website?url=https%3A%2F%2Femily-gl-2025.github.io%2Floop%2F&label=Live%20Site)](https://emily-gl-2025.github.io/loop/)
 [![GitHub License](https://img.shields.io/github/license/Emily-GL-2025/loop)](LICENSE)
 
-### [▶ Open the Live App](https://emily-gl-2025.github.io/loop/)
 
 </div>
 
